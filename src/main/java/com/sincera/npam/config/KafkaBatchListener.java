@@ -5,26 +5,26 @@ import com.sincera.npam.dto.MetricEvent;
 import com.sincera.npam.service.BigQueryService;
 import com.sincera.npam.service.LookupService;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Component;
 
 import java.util.*;
-import java.util.stream.Collectors;
 
 @Component
 public class KafkaBatchListener {
+
+    private static final Logger log = LoggerFactory.getLogger(KafkaBatchListener.class);
 
     private final ObjectMapper om = new ObjectMapper();
     private final BigQueryService bqService;
     private final LookupService lookupService;
 
-    @Value("${kafka.batch.size:200}")
+    @Value("${kafka.batch.size:2000}")
     private int batchSize;
-
-    @Value("${kafka.batch.poll-timeout-ms:1000}")
-    private long pollTimeoutMs;
 
     public KafkaBatchListener(BigQueryService bqService, LookupService lookupService) {
         this.bqService = bqService;
@@ -42,10 +42,10 @@ public class KafkaBatchListener {
         for (ConsumerRecord<String, String> rec : records) {
             try {
                 MetricEvent e = om.readValue(rec.value(), MetricEvent.class);
+                log.info("kafka-done>");
                 parsed.add(e);
             } catch (Exception ex) {
-                // optionally write raw rec.value() to DLQ; for speed we skip here
-                System.err.println("Failed to parse message, skipping: " + ex.getMessage());
+                log.error("Failed to parse message: " + ex.getMessage());
             }
         }
 
@@ -54,21 +54,21 @@ public class KafkaBatchListener {
             return;
         }
 
-        // If parsed size > batchSize, split into chunks
+        // partition to batches
         List<List<MetricEvent>> chunks = partition(parsed, batchSize);
 
-        boolean overallSuccess = true;
+        boolean allSuccess = true;
         for (List<MetricEvent> chunk : chunks) {
-            boolean success = bqService.writeBatch(chunk, lookupService);
-            if (!success) overallSuccess = false; // DLQ has been written inside service on permanent failure
+            boolean ok = bqService.insertRows(chunk, lookupService);
+            if (!ok) {
+                allSuccess = false;
+                log.error("BigQuery insert failed for a chunk of size " + chunk.size() + ". Will not ack offsets; Kafka will re-deliver.");
+                break;
+            }
         }
 
-        // Acknowledge offsets in all cases (we write failures to DLQ), to avoid stuck offsets.
-        ack.acknowledge();
-
-        if (!overallSuccess) {
-            // optionally emit a metric/alert
-            System.err.println("One or more batches failed and were persisted to DLQ.");
+        if (allSuccess) {
+            ack.acknowledge();
         }
     }
 
@@ -80,4 +80,3 @@ public class KafkaBatchListener {
         return out;
     }
 }
-

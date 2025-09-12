@@ -56,13 +56,6 @@
             <optional>true</optional>
         </dependency>
 
-        <!-- Google Cloud Storage client for DLQ -->
-        <dependency>
-            <groupId>com.google.cloud</groupId>
-            <artifactId>google-cloud-storage</artifactId>
-            <version>1.113.16</version>
-        </dependency>
-
         <!-- JSON -->
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>

@@ -1,55 +1,75 @@
 package com.sincera.npam.service;
 
-import com.google.cloud.bigquery.*;
-import com.google.cloud.storage.*;
+import com.sincera.npam.config.KafkaBatchListener;
 import com.sincera.npam.dto.MetricEvent;
+import com.google.cloud.bigquery.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeParseException;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
 
 @Service
 public class BigQueryService {
 
+    private static final Logger log = LoggerFactory.getLogger(BigQueryService.class);
+
     private final BigQuery bigQuery;
-    private final Storage storage;
-    private final String project;
     private final String dataset;
     private final String table;
-    private final TableId tableId;
-    private final String dlqBucket;
-
-    private final int maxAttempts = 4;
-    private final long initialBackoffMs = 200L;
 
     public BigQueryService(BigQuery bigQuery,
-                           Storage storage,
-                           @Value("${app.bigquery.project-id}") String project,
                            @Value("${app.bigquery.dataset}") String dataset,
-                           @Value("${app.bigquery.table}") String table,
-                           @Value("${app.bigquery.dlq-bucket:}") String dlqBucket) {
+                           @Value("${app.bigquery.table}") String table) {
         this.bigQuery = bigQuery;
-        this.storage = storage;
-        this.project = project;
         this.dataset = dataset;
         this.table = table;
-        this.tableId = TableId.of(project, dataset, table);
-        this.dlqBucket = dlqBucket;
     }
 
-    public boolean writeBatch(List<MetricEvent> events, LookupService lookupService) {
-        List<InsertAllRequest.RowToInsert> rows = new ArrayList<>(events.size());
+    /**
+     * Inserts a batch of events into BigQuery using insertAll.
+     * Returns true when no insert errors (success). If insertAll returns errors, we return false.
+     * NOTE: no custom retry or DLQ here (per your constraint).
+     */
+    public boolean insertRows(List<MetricEvent> events, LookupService lookupService) {
+        if (events == null || events.isEmpty()) return true;
+
+        TableId tableId = TableId.of(dataset, table);
+        InsertAllRequest.Builder builder = InsertAllRequest.newBuilder(tableId);
+
         for (MetricEvent e : events) {
             Map<String, Object> row = new HashMap<>();
-            // map fields to table columns
+
+            // timestamp handling: fallback to now() if parse fails
             String ts = e.getTimestamp();
-            long epoch = toEpochSec(ts);
-            row.put("event_timestamp", ts);
+            long epoch = 0L;
+            String tsForBq = null;
+            if (ts != null) {
+                try {
+                    OffsetDateTime odt = OffsetDateTime.parse(ts);
+                    epoch = odt.toEpochSecond();
+                    tsForBq = odt.toString();
+                } catch (DateTimeParseException ex) {
+                    try {
+                        epoch = java.time.Instant.parse(ts).getEpochSecond();
+                        tsForBq = java.time.Instant.parse(ts).toString();
+                    } catch (Exception ex2) {
+                        epoch = java.time.Instant.now().getEpochSecond();
+                        tsForBq = java.time.Instant.now().toString();
+                    }
+                }
+            } else {
+                epoch = java.time.Instant.now().getEpochSecond();
+                tsForBq = java.time.Instant.now().toString();
+            }
+
+            row.put("event_timestamp", tsForBq);
             row.put("event_epoch", epoch);
-            row.put("collection_interval", "60m");
+            row.put("collection_interval", "60m"); // default as per spec
             row.put("device_name", e.getDevice_name());
             row.put("device_type", e.getDevice_type());
             row.put("device_ip_address", null);
@@ -61,66 +81,28 @@ public class BigQueryService {
             row.put("source_metric_type", e.getParameter_name());
             row.put("source_system", e.getSourceSystem() == null ? "Maestro" : e.getSourceSystem());
 
+            // deterministic insertId for idempotency (device|param|timestamp|raw)
             String insertId = generateInsertId(e);
-            rows.add(InsertAllRequest.RowToInsert.of(insertId, row));
+            builder.addRow(insertId, row);
+            log.info("bq-done>");
         }
 
-        List<InsertAllRequest.RowToInsert> toTry = rows;
-        int attempt = 0;
-        long backoff = initialBackoffMs;
-        while (attempt < maxAttempts && !toTry.isEmpty()) {
-            InsertAllRequest.Builder builder = InsertAllRequest.newBuilder(tableId);
-            toTry.forEach(builder::addRow);
-            InsertAllRequest request = builder.build();
-            InsertAllResponse response = bigQuery.insertAll(request);
-            if (!response.hasErrors()) return true;
-
-            // collect failed rows
-            Map<Long, List<BigQueryError>> errors = response.getInsertErrors();
-            List<InsertAllRequest.RowToInsert> failed = new ArrayList<>();
-            for (Long idx : errors.keySet()) {
-                failed.add(toTry.get(idx.intValue()));
+        InsertAllRequest req = builder.build();
+        try {
+            InsertAllResponse resp = bigQuery.insertAll(req);
+            if (resp.hasErrors()) {
+                // log details and return false (no retry/dlq per your constraint)
+                Map<Long, List<BigQueryError>> errs = resp.getInsertErrors();
+                log.error("BigQuery insert errors for batch size " + events.size() + ": " + errs.size());
+                errs.forEach((idx, list) -> System.err.println("row idx " + idx + " errors: " + list));
+                return false;
+            } else {
+                return true;
             }
-            toTry = failed;
-            attempt++;
-            try { TimeUnit.MILLISECONDS.sleep(backoff); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-            backoff *= 2;
-        }
-
-        if (!toTry.isEmpty()) {
-            persistToDlq(toTry);
+        } catch (BigQueryException ex) {
+            // streaming RPC failure — return false and let caller decide (we will not retry here)
+            log.error("BigQuery insertAll exception: " + ex.getMessage());
             return false;
-        }
-        return true;
-    }
-
-    private void persistToDlq(List<InsertAllRequest.RowToInsert> rows) {
-        if (dlqBucket == null || dlqBucket.isEmpty()) {
-            System.err.println("DLQ not configured. Failed rows count: " + rows.size());
-            return;
-        }
-        try {
-            String filename = "dlq/failed_" + System.currentTimeMillis() + ".ndjson";
-            StringBuilder sb = new StringBuilder();
-            com.fasterxml.jackson.databind.ObjectMapper om = new com.fasterxml.jackson.databind.ObjectMapper();
-            for (InsertAllRequest.RowToInsert r : rows) {
-                sb.append(om.writeValueAsString(r.getContent())).append("\n");
-            }
-            BlobId blobId = BlobId.of(dlqBucket, filename);
-            BlobInfo info = BlobInfo.newBuilder(blobId).setContentType("application/x-ndjson").build();
-            storage.create(info, sb.toString().getBytes(StandardCharsets.UTF_8));
-            System.out.println("Wrote DLQ to gs://" + dlqBucket + "/" + filename);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
-    private long toEpochSec(String ts) {
-        if (ts == null) return 0L;
-        try {
-            return java.time.OffsetDateTime.parse(ts).toEpochSecond();
-        } catch (Exception e) {
-            try { return java.time.Instant.parse(ts).getEpochSecond(); } catch (Exception ex) { return 0L; }
         }
     }
 
@@ -131,7 +113,7 @@ public class BigQueryService {
                     (e.getTimestamp() == null ? "" : e.getTimestamp()) + "|" +
                     (e.getRaw_value() == null ? "" : e.getRaw_value().toString());
             MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] digest = md.digest(seed.getBytes(StandardCharsets.UTF_8));
+            byte[] digest = md.digest(seed.getBytes("UTF-8"));
             StringBuilder sb = new StringBuilder();
             for (byte b : digest) sb.append(String.format("%02x", b));
             return sb.toString();
@@ -140,4 +122,3 @@ public class BigQueryService {
         }
     }
 }
-

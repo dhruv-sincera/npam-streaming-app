@@ -23,18 +23,18 @@ public class LookupService {
 
     @PostConstruct
     public void loadLookup() {
-        // Expect lookupTable in format PROJECT:DATASET.TABLE
         String sql = String.format("SELECT source_metric_type, normalized_metric_type FROM `%s`", lookupTable);
         QueryJobConfiguration q = QueryJobConfiguration.newBuilder(sql).setUseLegacySql(false).build();
         try {
-            for (FieldValueList row : bigQuery.query(q).iterateAll()) {
+            TableResult result = bigQuery.query(q);
+            for (FieldValueList row : result.iterateAll()) {
                 String src = row.get("source_metric_type").getStringValue();
                 String norm = row.get("normalized_metric_type").getStringValue();
                 lookup.put(src, norm);
             }
-            System.out.println("Loaded lookup entries: " + lookup.size());
+            System.out.println("Loaded metric lookup entries: " + lookup.size());
         } catch (Exception e) {
-            throw new RuntimeException("Failed to load metric lookup from BigQuery", e);
+            throw new RuntimeException("Failed to load lookup table: " + lookupTable, e);
         }
     }
 
