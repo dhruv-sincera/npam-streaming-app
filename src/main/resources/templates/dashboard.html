@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <title>NPAM Streaming Dashboard</title>
+    <script>
+        async function startPipeline() {
+          await fetch('/npam/start', { method: 'POST' });
+          updateStatus();
+        }
+        async function stopPipeline() {
+          await fetch('/npam/stop', { method: 'POST' });
+          updateStatus();
+        }
+        async function updateStatus() {
+          const res = await fetch('/npam/status');
+          const data = await res.json();
+
+          document.getElementById("status").innerText =
+            data.running ? "Running ✅" : "Stopped ⛔";
+
+          document.getElementById("consumed").innerText = data.consumed;
+          document.getElementById("pushed").innerText = data.pushed;
+
+          document.getElementById("startBtn").disabled = data.running;
+          document.getElementById("stopBtn").disabled = !data.running;
+        }
+        setInterval(updateStatus, 2000);
+        window.onload = updateStatus;
+    </script>
+</head>
+<body>
+<h1>NPAM Streaming Dashboard</h1>
+<p>Status: <span id="status"></span></p>
+<p>Consumed: <span id="consumed">0</span></p>
+<p>Pushed: <span id="pushed">0</span></p>
+
+<button id="startBtn" onclick="startPipeline()">Start</button>
+<button id="stopBtn" onclick="stopPipeline()">Stop</button>
+</body>
+</html>

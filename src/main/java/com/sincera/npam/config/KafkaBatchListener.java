@@ -22,16 +22,18 @@ public class KafkaBatchListener {
     private final ObjectMapper om = new ObjectMapper();
     private final BigQueryService bqService;
     private final LookupService lookupService;
+    private final PipelineMetrics metrics;
 
     @Value("${kafka.batch.size:2000}")
     private int batchSize;
 
-    public KafkaBatchListener(BigQueryService bqService, LookupService lookupService) {
+    public KafkaBatchListener(BigQueryService bqService, LookupService lookupService, PipelineMetrics metrics) {
         this.bqService = bqService;
         this.lookupService = lookupService;
+        this.metrics = metrics;
     }
 
-    @KafkaListener(topics = "${kafka.topic}", containerFactory = "kafkaBatchFactory")
+    @KafkaListener(id = "${kafka.group-id}", topics = "${kafka.topic}", containerFactory = "kafkaBatchFactory")
     public void listen(List<ConsumerRecord<String, String>> records, Acknowledgment ack) {
         if (records == null || records.isEmpty()) {
             ack.acknowledge();
@@ -44,6 +46,7 @@ public class KafkaBatchListener {
                 MetricEvent e = om.readValue(rec.value(), MetricEvent.class);
                 log.info("kafka-done>");
                 parsed.add(e);
+                metrics.incrementConsumed(records.size());
             } catch (Exception ex) {
                 log.error("Failed to parse message: " + ex.getMessage());
             }
@@ -69,6 +72,7 @@ public class KafkaBatchListener {
 
         if (allSuccess) {
             ack.acknowledge();
+            metrics.incrementPushed(records.size());
         }
     }
 
